@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -256,10 +257,11 @@ def build_extraction_plan(
 #  Extraction – the main workhorse
 # ---------------------------------------------------------------------------
 
-def _write_chapter_fast(reader, start_idx: int, end_idx: int, output_path: str) -> None:
+def _write_chapter_fast(reader, start_idx: int, end_idx: int, output_path: str, _PdfWriter=None) -> None:
     """Write pages [start_idx, end_idx] to *output_path* using fast batch append."""
-    _, PdfWriter = _load_pypdf()
-    writer = PdfWriter()
+    if _PdfWriter is None:
+        _, _PdfWriter = _load_pypdf()
+    writer = _PdfWriter()
     # append() with a page range is dramatically faster than per-page add_page()
     # because it batch-copies indirect objects instead of cloning each page.
     writer.append(reader, pages=list(range(start_idx, end_idx + 1)))
@@ -292,7 +294,7 @@ def extract_chapters_from_pdf(
     os.makedirs(output_dir, exist_ok=True)
     _log(f"Processing '{pdf_path}'...", logger)
 
-    PdfReader, _ = _load_pypdf()
+    PdfReader, PdfWriter = _load_pypdf()
     reader = PdfReader(pdf_path)
     outline = getattr(reader, "outline", None)
     if not outline:
@@ -354,7 +356,7 @@ def extract_chapters_from_pdf(
         output_pdf_path = os.path.join(output_dir, output_filename)
         output_pdf_path = _unique_path(output_pdf_path)
 
-        _write_chapter_fast(reader, start_page_idx, end_page_idx, output_pdf_path)
+        _write_chapter_fast(reader, start_page_idx, end_page_idx, output_pdf_path, _PdfWriter=PdfWriter)
 
         saved_files.append(output_pdf_path)
         _log(f"    Saved: {output_pdf_path}", logger)
@@ -388,7 +390,7 @@ def extract_selected_chapters(
     os.makedirs(output_dir, exist_ok=True)
     _log(f"Processing '{pdf_path}'...", logger)
 
-    PdfReader, _ = _load_pypdf()
+    PdfReader, PdfWriter = _load_pypdf()
     reader = PdfReader(pdf_path)
     total = len(plan_entries)
     _log(f"Extracting {total} selected chapter(s).", logger)
@@ -410,7 +412,7 @@ def extract_selected_chapters(
         output_pdf_path = os.path.join(output_dir, filename)
         output_pdf_path = _unique_path(output_pdf_path)
 
-        _write_chapter_fast(reader, start_idx, end_idx, output_pdf_path)
+        _write_chapter_fast(reader, start_idx, end_idx, output_pdf_path, _PdfWriter=PdfWriter)
 
         saved_files.append(output_pdf_path)
         _log(f"    Saved: {output_pdf_path}", logger)
@@ -538,14 +540,19 @@ def run_gui() -> None:
             self.output_dir_var = tk.StringVar(value="chapters_output")
             self.level_var = tk.IntVar(value=0)
             self._extracting = False
+            self._busy_page_range = False  # guard for page-range tab
+            self._busy_merge = False       # guard for merge tab
             self._cancel_event = threading.Event()
             self._inspection_cache: dict | None = None
             self._current_plan: ExtractionPlan | None = None  # cached preview plan
             self._check_states: dict[str, bool] = {}  # iid -> checked
+            self._last_browse_dir: str | None = None  # remember last directory
+            self._extraction_start_time: float = 0.0
 
             # ── styling ──────────────────────────────────────────────────
             self._configure_styles()
             self._build_ui()
+            self._bind_shortcuts()
             self.root.after(100, self._drain_logs)
 
         # ─── ttk styling ─────────────────────────────────────────────────
@@ -742,6 +749,7 @@ def run_gui() -> None:
             bottom = ttk.Frame(tab)
             bottom.pack(fill="x", pady=(4, 0))
             ttk.Button(bottom, text="📂 Open Output Folder", style="Green.TButton", command=self._open_output).pack(side="left")
+            ttk.Button(bottom, text="💾 Export Log", command=self._export_log).pack(side="right", padx=(4, 0))
             ttk.Button(bottom, text="🗑 Clear Log", command=self._clear_log).pack(side="right")
 
         # ═══════════════════════════════════════════════════════════════
@@ -757,7 +765,9 @@ def run_gui() -> None:
 
             # re-use main PDF path
             info_label = ttk.Label(tab, text="Uses the PDF file from the main tab.", foreground=FG_DIM)
-            info_label.pack(anchor="w", pady=(0, 8))
+            info_label.pack(anchor="w", pady=(0, 4))
+            self._range_pages_hint = ttk.Label(tab, text="", foreground=YELLOW, font=("Segoe UI", 9, "bold"))
+            self._range_pages_hint.pack(anchor="w", pady=(0, 8))
 
             range_frame = ttk.LabelFrame(tab, text="  Page Range  ", padding=10)
             range_frame.pack(fill="x", pady=(0, 10))
@@ -846,6 +856,22 @@ def run_gui() -> None:
         def _set_status(self, text: str) -> None:
             self.status_label.configure(text=text)
 
+        def _export_log(self) -> None:
+            """Save the current log contents to a text file."""
+            content = self.log_text.get("1.0", "end").strip()
+            if not content:
+                messagebox.showinfo("Empty log", "There is nothing in the log to export.")
+                return
+            path = filedialog.asksaveasfilename(
+                title="Save log as",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            )
+            if path:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self._set_status(f"Log exported to {path}")
+
         # ─── Validation ──────────────────────────────────────────────
         def _validate_pdf(self) -> str | None:
             path = self.pdf_path_var.get().strip()
@@ -857,20 +883,34 @@ def run_gui() -> None:
                 return None
             return path
 
+        # ─── Keyboard shortcuts ──────────────────────────────────────
+        def _bind_shortcuts(self) -> None:
+            self.root.bind("<Control-o>", lambda e: self._select_pdf())
+            self.root.bind("<Control-e>", lambda e: self._extract())
+            self.root.bind("<Escape>", lambda e: self._cancel_extraction() if self._extracting else None)
+
         # ─── File dialogs ────────────────────────────────────────────
         def _select_pdf(self) -> None:
+            initial = self._last_browse_dir or ""
             selected = filedialog.askopenfilename(
-                title="Select PDF", filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+                title="Select PDF",
+                initialdir=initial,
+                filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
             )
             if selected:
                 self.pdf_path_var.set(selected)
+                self._last_browse_dir = os.path.dirname(selected)
                 self._inspection_cache = None
-                self.summary_label.config(text="PDF changed — click Inspect to reload bookmark info.")
+                self.summary_label.config(text="Loading PDF info…")
+                # Auto-inspect on load
+                self._inspect()
 
         def _select_output(self) -> None:
-            selected = filedialog.askdirectory(title="Select output directory")
+            initial = self._last_browse_dir or ""
+            selected = filedialog.askdirectory(title="Select output directory", initialdir=initial)
             if selected:
                 self.output_dir_var.set(selected)
+                self._last_browse_dir = selected
 
         # ─── Inspect ─────────────────────────────────────────────────
         def _inspect(self) -> None:
@@ -889,6 +929,12 @@ def run_gui() -> None:
                         summary += f" | Levels: {info['levels']}"
                     self.root.after(0, lambda: self.summary_label.config(text=summary))
                     self.log_queue.put(summary)
+                    # Update page-range tab with page count
+                    pages = info['pages']
+                    self.root.after(0, lambda: self._range_pages_hint.config(
+                        text=f"This PDF has {pages} pages (valid range: 1–{pages})"
+                    ))
+                    self.root.after(0, lambda: self.range_end_var.set(pages))
                     self.root.after(0, lambda: self._set_status("Inspection complete"))
                 except Exception as exc:
                     self.root.after(0, lambda: messagebox.showerror("Inspect failed", str(exc)))
@@ -908,8 +954,11 @@ def run_gui() -> None:
             def worker():
                 try:
                     plan = build_extraction_plan(path, chapter_level)
+                    total_pages = sum(ch["pages_count"] for ch in plan.chapters)
                     self.root.after(0, lambda: self._show_plan(plan))
-                    self.root.after(0, lambda: self._set_status(f"Preview: {len(plan.chapters)} chapters"))
+                    self.root.after(0, lambda: self._set_status(
+                        f"Preview: {len(plan.chapters)} chapters, {total_pages} total pages"
+                    ))
                 except Exception as exc:
                     self.root.after(0, lambda: messagebox.showerror("Preview failed", str(exc)))
                     self.root.after(0, lambda: self._set_status("Preview failed"))
@@ -934,12 +983,9 @@ def run_gui() -> None:
 
         # ─── Checkbox helpers ─────────────────────────────────────────
         def _on_tree_click(self, event) -> None:
-            """Toggle the checkbox when the user clicks on the check column."""
+            """Toggle the checkbox when the user clicks anywhere on the row."""
             region = self.preview_tree.identify_region(event.x, event.y)
-            if region != "cell":
-                return
-            col = self.preview_tree.identify_column(event.x)
-            if col != "#1":  # the "check" column
+            if region not in ("cell", "tree"):
                 return
             iid = self.preview_tree.identify_row(event.y)
             if not iid:
@@ -1002,11 +1048,16 @@ def run_gui() -> None:
             self.extract_sel_btn.state(["disabled"])
             self.cancel_btn.state(["!disabled"])
             self.progress_var.set(0)
+            self._extraction_start_time = time.monotonic()
 
         def _on_progress(self, current, total):
             pct = (current / total) * 100 if total else 0
-            self.root.after(0, lambda: self.progress_var.set(pct))
-            self.root.after(0, lambda: self._set_status(f"Extracting… {current}/{total}"))
+            elapsed = time.monotonic() - self._extraction_start_time
+            _pct, _cur, _tot = pct, current, total  # snapshot for closure
+            self.root.after(0, lambda: self.progress_var.set(_pct))
+            self.root.after(0, lambda: self._set_status(
+                f"Extracting… {_cur}/{_tot}  ({elapsed:.1f}s)"
+            ))
 
         def _extract(self) -> None:
             """Extract ALL chapters (ignores checkbox selection)."""
@@ -1034,8 +1085,9 @@ def run_gui() -> None:
                         cancel_event=self._cancel_event,
                     )
                     n = len(result["files_written"])
-                    self.log_queue.put(f"Done. Wrote {n} files to {result['output_dir']}")
-                    self.root.after(0, lambda: self._set_status(f"Done — {n} files written"))
+                    elapsed = time.monotonic() - self._extraction_start_time
+                    self.log_queue.put(f"Done. Wrote {n} files to {result['output_dir']} in {elapsed:.1f}s")
+                    self.root.after(0, lambda: self._set_status(f"Done — {n} files written in {elapsed:.1f}s"))
                     self.root.after(0, lambda: self.progress_var.set(100))
                 except Exception as exc:
                     self.log_queue.put(f"Error: {exc}")
@@ -1076,8 +1128,9 @@ def run_gui() -> None:
                         cancel_event=self._cancel_event,
                     )
                     n = len(result["files_written"])
-                    self.log_queue.put(f"Done. Wrote {n} files to {result['output_dir']}")
-                    self.root.after(0, lambda: self._set_status(f"Done — {n} files written"))
+                    elapsed = time.monotonic() - self._extraction_start_time
+                    self.log_queue.put(f"Done. Wrote {n} files to {result['output_dir']} in {elapsed:.1f}s")
+                    self.root.after(0, lambda: self._set_status(f"Done — {n} files written in {elapsed:.1f}s"))
                     self.root.after(0, lambda: self.progress_var.set(100))
                 except Exception as exc:
                     self.log_queue.put(f"Error: {exc}")
@@ -1109,6 +1162,8 @@ def run_gui() -> None:
         #  Tab 2 actions — Page Range
         # ─────────────────────────────────────────────────────────────
         def _extract_page_range(self) -> None:
+            if self._busy_page_range:
+                return
             path = self._validate_pdf()
             if not path:
                 return
@@ -1116,6 +1171,14 @@ def run_gui() -> None:
             end = self.range_end_var.get()
             out = self.range_output_var.get().strip() or None
 
+            # Place output in the chosen output directory when no explicit path given
+            if out is None:
+                out_dir = self.output_dir_var.get().strip() or "chapters_output"
+                os.makedirs(out_dir, exist_ok=True)
+                stem = Path(path).stem
+                out = os.path.join(out_dir, f"{stem}_pages_{start}-{end}.pdf")
+
+            self._busy_page_range = True
             self._set_status("Extracting page range…")
 
             def worker():
@@ -1127,6 +1190,8 @@ def run_gui() -> None:
                 except Exception as exc:
                     self.root.after(0, lambda: messagebox.showerror("Extraction failed", str(exc)))
                     self.root.after(0, lambda: self._set_status("Page range extraction failed"))
+                finally:
+                    self._busy_page_range = False
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -1182,11 +1247,14 @@ def run_gui() -> None:
                 self.merge_output_var.set(selected)
 
         def _do_merge(self) -> None:
+            if self._busy_merge:
+                return
             if not self._merge_files:
                 messagebox.showinfo("No files", "Add at least one PDF to merge.")
                 return
             out = self.merge_output_var.get().strip() or "merged.pdf"
             files = list(self._merge_files)
+            self._busy_merge = True
             self._set_status("Merging PDFs…")
 
             def worker():
@@ -1198,6 +1266,8 @@ def run_gui() -> None:
                 except Exception as exc:
                     self.root.after(0, lambda: messagebox.showerror("Merge failed", str(exc)))
                     self.root.after(0, lambda: self._set_status("Merge failed"))
+                finally:
+                    self._busy_merge = False
 
             threading.Thread(target=worker, daemon=True).start()
 

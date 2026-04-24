@@ -10,9 +10,13 @@ Extract chapter PDFs from a bookmarked source PDF, extract specific page ranges,
 - **Page Range Extraction** – pull out arbitrary page ranges without needing bookmarks.
 - **PDF Merging** – combine multiple PDFs into one, with reorder support.
 - **Fast Performance** – uses pypdf's batch `append()` API instead of per-page cloning for dramatically faster extraction.
-- **Progress & Cancellation** – real-time progress bar with the ability to cancel mid-extraction.
+- **Progress & Cancellation** – real-time progress bar with elapsed time and the ability to cancel mid-extraction.
+- **Auto-Inspect** – selecting a PDF automatically loads its bookmark metadata.
 - **Inspect mode** – view available bookmark levels and a bookmark tree.
+- **Keyboard shortcuts** – `Ctrl+O` to open, `Ctrl+E` to extract, `Escape` to cancel.
+- **Export Log** – save the extraction log to a text file for debugging.
 - **Open Output Folder** – one-click to open the output directory in your file manager.
+- **Remembers directories** – file dialogs start from the last-used folder.
 - **Cross-platform** – works on Windows, macOS, and Linux.
 - **Safe filenames** – output filenames are sanitized and deduplicated automatically.
 - **Modern dark GUI** – a polished Catppuccin-themed Tkinter interface.
@@ -58,23 +62,31 @@ python pdf_chapter_extractor.py --gui
 The GUI has three tabs:
 
 ### 📁 Chapter Extraction
-1. Select a PDF file.
+1. Select a PDF file (`Ctrl+O`). The app **auto-inspects** and shows bookmark levels.
 2. Choose an output folder.
-3. Click **Inspect** to see available bookmark levels.
-4. Set the chapter level and click **Preview** to review what will be extracted.
-5. Use the **☑/☐ checkboxes** in the preview table to include or exclude specific chapters. Use **Select All**, **Deselect All**, or **Invert** for bulk changes.
-6. Click **Extract All** to extract every chapter, or **Extract Selected** to extract only the checked ones.
-7. A progress bar shows real-time status; click **Cancel** to abort.
-8. Click **Open Output Folder** to view the results.
+3. Set the chapter level and click **Preview** to review what will be extracted.
+4. Click anywhere on a row to **toggle its checkbox**. Use **Select All**, **Deselect All**, or **Invert** for bulk changes.
+5. Click **Extract All** (`Ctrl+E`) to extract every chapter, or **Extract Selected** to extract only the checked ones.
+6. A progress bar shows real-time status with **elapsed time**; press `Escape` or click **Cancel** to abort.
+7. Click **Open Output Folder** to view the results, or **Export Log** to save the log.
 
 ### 📄 Page Range
-1. Set the start and end page numbers.
-2. Click **Extract Page Range**.
+1. After loading a PDF, the total page count is displayed so you know the valid range.
+2. Set the start and end page numbers and click **Extract Page Range**.
+3. Output is saved to the configured output folder by default.
 
 ### 🔗 Merge PDFs
 1. Add PDF files and reorder them as needed.
 2. Set the output filename.
 3. Click **Merge PDFs**.
+
+## Keyboard Shortcuts
+
+| Shortcut    | Action              |
+|-------------|---------------------|
+| `Ctrl+O`    | Open PDF file       |
+| `Ctrl+E`    | Extract all chapters|
+| `Escape`    | Cancel extraction   |
 
 ## Notes
 
