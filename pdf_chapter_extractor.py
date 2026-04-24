@@ -31,7 +31,7 @@ class ChapterStart:
 @dataclass
 class ExtractionPlan:
     """Pre-computed plan showing what chapters will be extracted and page ranges."""
-    chapters: list[dict] = field(default_factory=list)  # {title, start_page, end_page, pages_count, filename}
+    chapters: list[dict] = field(default_factory=list)  # {title, start_page, end_page, pages_count, filename, idx}
     total_pages: int = 0
     level: int = 0
 
@@ -241,6 +241,7 @@ def build_extraction_plan(
         used_filenames.add(filename)
 
         plan.chapters.append({
+            "idx": idx,
             "title": chapter.title,
             "start_page": start_page_idx + 1,
             "end_page": end_page_idx + 1,
@@ -254,6 +255,17 @@ def build_extraction_plan(
 # ---------------------------------------------------------------------------
 #  Extraction – the main workhorse
 # ---------------------------------------------------------------------------
+
+def _write_chapter_fast(reader, start_idx: int, end_idx: int, output_path: str) -> None:
+    """Write pages [start_idx, end_idx] to *output_path* using fast batch append."""
+    _, PdfWriter = _load_pypdf()
+    writer = PdfWriter()
+    # append() with a page range is dramatically faster than per-page add_page()
+    # because it batch-copies indirect objects instead of cloning each page.
+    writer.append(reader, pages=list(range(start_idx, end_idx + 1)))
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
 
 def extract_chapters_from_pdf(
     pdf_path: str,
@@ -280,7 +292,7 @@ def extract_chapters_from_pdf(
     os.makedirs(output_dir, exist_ok=True)
     _log(f"Processing '{pdf_path}'...", logger)
 
-    PdfReader, PdfWriter = _load_pypdf()
+    PdfReader, _ = _load_pypdf()
     reader = PdfReader(pdf_path)
     outline = getattr(reader, "outline", None)
     if not outline:
@@ -313,7 +325,6 @@ def extract_chapters_from_pdf(
     used_filenames: set[str] = set()
 
     for idx, chapter in enumerate(unique_starts):
-        # Check cancellation
         if cancel_event and cancel_event.is_set():
             _log("Extraction cancelled by user.", logger)
             break
@@ -330,14 +341,6 @@ def extract_chapters_from_pdf(
 
         _log(f"  Extracting '{chapter.title}' (pages {start_page_idx + 1}-{end_page_idx + 1})", logger)
 
-        writer = PdfWriter()
-        for page_num in range(start_page_idx, end_page_idx + 1):
-            writer.add_page(reader.pages[page_num])
-
-        if not writer.pages:
-            _log(f"    Skipping '{chapter.title}' because no pages were collected.", logger)
-            continue
-
         # Build a unique output filename
         output_filename = f"{idx + 1:03d}_{sanitize_filename(chapter.title)}.pdf"
         if output_filename in used_filenames:
@@ -351,8 +354,7 @@ def extract_chapters_from_pdf(
         output_pdf_path = os.path.join(output_dir, output_filename)
         output_pdf_path = _unique_path(output_pdf_path)
 
-        with open(output_pdf_path, "wb") as file_out:
-            writer.write(file_out)
+        _write_chapter_fast(reader, start_page_idx, end_page_idx, output_pdf_path)
 
         saved_files.append(output_pdf_path)
         _log(f"    Saved: {output_pdf_path}", logger)
@@ -363,6 +365,62 @@ def extract_chapters_from_pdf(
     _log("Extraction complete.", logger)
     return {
         "chapters_found": len(unique_starts),
+        "files_written": saved_files,
+        "output_dir": output_dir,
+    }
+
+
+def extract_selected_chapters(
+    pdf_path: str,
+    plan_entries: list[dict],
+    output_dir: str = "chapters_output",
+    logger: Callable[[str], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    """Extract only the chapters specified by *plan_entries* (from an ExtractionPlan).
+
+    Each entry must have keys: title, start_page, end_page, filename (1-indexed pages).
+    """
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: '{pdf_path}'")
+
+    os.makedirs(output_dir, exist_ok=True)
+    _log(f"Processing '{pdf_path}'...", logger)
+
+    PdfReader, _ = _load_pypdf()
+    reader = PdfReader(pdf_path)
+    total = len(plan_entries)
+    _log(f"Extracting {total} selected chapter(s).", logger)
+
+    saved_files: list[str] = []
+
+    for i, entry in enumerate(plan_entries):
+        if cancel_event and cancel_event.is_set():
+            _log("Extraction cancelled by user.", logger)
+            break
+
+        start_idx = entry["start_page"] - 1  # convert to 0-indexed
+        end_idx = entry["end_page"] - 1
+        title = entry["title"]
+        filename = entry["filename"]
+
+        _log(f"  Extracting '{title}' (pages {entry['start_page']}-{entry['end_page']})", logger)
+
+        output_pdf_path = os.path.join(output_dir, filename)
+        output_pdf_path = _unique_path(output_pdf_path)
+
+        _write_chapter_fast(reader, start_idx, end_idx, output_pdf_path)
+
+        saved_files.append(output_pdf_path)
+        _log(f"    Saved: {output_pdf_path}", logger)
+
+        if progress_callback:
+            progress_callback(i + 1, total)
+
+    _log("Extraction complete.", logger)
+    return {
+        "chapters_found": total,
         "files_written": saved_files,
         "output_dir": output_dir,
     }
@@ -401,8 +459,7 @@ def extract_page_range(
     output_path = _unique_path(output_path)
 
     writer = PdfWriter()
-    for i in range(start_page - 1, end_page):
-        writer.add_page(reader.pages[i])
+    writer.append(reader, pages=list(range(start_page - 1, end_page)))
 
     with open(output_path, "wb") as f:
         writer.write(f)
@@ -434,8 +491,7 @@ def merge_pdfs(
         if not os.path.exists(p):
             raise FileNotFoundError(f"PDF file not found: '{p}'")
         reader = PdfReader(p)
-        for page in reader.pages:
-            writer.add_page(page)
+        writer.append(reader)  # batch append is much faster than per-page add_page
         _log(f"  Added {len(reader.pages)} pages from '{os.path.basename(p)}'", logger)
 
     output_path = _unique_path(output_path)
@@ -484,6 +540,8 @@ def run_gui() -> None:
             self._extracting = False
             self._cancel_event = threading.Event()
             self._inspection_cache: dict | None = None
+            self._current_plan: ExtractionPlan | None = None  # cached preview plan
+            self._check_states: dict[str, bool] = {}  # iid -> checked
 
             # ── styling ──────────────────────────────────────────────────
             self._configure_styles()
@@ -620,8 +678,10 @@ def run_gui() -> None:
             right_ctrl.pack(side="right")
             ttk.Button(right_ctrl, text="🔎 Inspect", command=self._inspect).pack(side="left", padx=4)
             ttk.Button(right_ctrl, text="📋 Preview", command=self._preview_extraction).pack(side="left", padx=4)
-            self.extract_btn = ttk.Button(right_ctrl, text="⚡ Extract", style="Accent.TButton", command=self._extract)
+            self.extract_btn = ttk.Button(right_ctrl, text="⚡ Extract All", style="Accent.TButton", command=self._extract)
             self.extract_btn.pack(side="left", padx=4)
+            self.extract_sel_btn = ttk.Button(right_ctrl, text="⚡ Extract Selected", style="Accent.TButton", command=self._extract_selected)
+            self.extract_sel_btn.pack(side="left", padx=4)
             self.cancel_btn = ttk.Button(right_ctrl, text="✖ Cancel", style="Cancel.TButton", command=self._cancel_extraction)
             self.cancel_btn.pack(side="left", padx=4)
             self.cancel_btn.state(["disabled"])
@@ -636,19 +696,33 @@ def run_gui() -> None:
             self.progress_bar.pack(fill="x", pady=(0, 6))
 
             # -- Preview tree ──────────────────────────────────────────────
-            preview_frame = ttk.LabelFrame(tab, text="  Extraction Preview  ", padding=6)
+            preview_frame = ttk.LabelFrame(tab, text="  Extraction Preview  (click ☐ to toggle)", padding=6)
             preview_frame.pack(fill="both", expand=True, pady=(0, 6))
 
-            cols = ("title", "pages", "count", "filename")
+            # Selection buttons row
+            sel_row = ttk.Frame(preview_frame)
+            sel_row.pack(fill="x", pady=(0, 4))
+            ttk.Button(sel_row, text="☑ Select All", command=self._select_all_chapters).pack(side="left", padx=2)
+            ttk.Button(sel_row, text="☐ Deselect All", command=self._deselect_all_chapters).pack(side="left", padx=2)
+            ttk.Button(sel_row, text="⇆ Invert", command=self._invert_chapter_selection).pack(side="left", padx=2)
+            self._sel_count_label = ttk.Label(sel_row, text="", style="Subtitle.TLabel")
+            self._sel_count_label.pack(side="right", padx=8)
+
+            cols = ("check", "title", "pages", "count", "filename")
             self.preview_tree = ttk.Treeview(preview_frame, columns=cols, show="headings", height=6)
+            self.preview_tree.heading("check", text="✓")
             self.preview_tree.heading("title", text="Chapter Title")
             self.preview_tree.heading("pages", text="Page Range")
             self.preview_tree.heading("count", text="Pages")
             self.preview_tree.heading("filename", text="Output File")
-            self.preview_tree.column("title", width=280)
-            self.preview_tree.column("pages", width=100, anchor="center")
-            self.preview_tree.column("count", width=60, anchor="center")
-            self.preview_tree.column("filename", width=260)
+            self.preview_tree.column("check", width=36, anchor="center", stretch=False)
+            self.preview_tree.column("title", width=260)
+            self.preview_tree.column("pages", width=90, anchor="center")
+            self.preview_tree.column("count", width=55, anchor="center")
+            self.preview_tree.column("filename", width=250)
+
+            # Click to toggle checkbox
+            self.preview_tree.bind("<ButtonRelease-1>", self._on_tree_click)
 
             tree_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview_tree.yview)
             self.preview_tree.configure(yscrollcommand=tree_scroll.set)
@@ -843,18 +917,99 @@ def run_gui() -> None:
             threading.Thread(target=worker, daemon=True).start()
 
         def _show_plan(self, plan: ExtractionPlan) -> None:
+            self._current_plan = plan
+            self._check_states.clear()
             for item in self.preview_tree.get_children():
                 self.preview_tree.delete(item)
-            for ch in plan.chapters:
-                self.preview_tree.insert("", "end", values=(
+            for i, ch in enumerate(plan.chapters):
+                iid = self.preview_tree.insert("", "end", values=(
+                    "☑",
                     ch["title"],
                     f"{ch['start_page']}–{ch['end_page']}",
                     ch["pages_count"],
                     ch["filename"],
                 ))
+                self._check_states[iid] = True  # all checked by default
+            self._update_sel_count()
+
+        # ─── Checkbox helpers ─────────────────────────────────────────
+        def _on_tree_click(self, event) -> None:
+            """Toggle the checkbox when the user clicks on the check column."""
+            region = self.preview_tree.identify_region(event.x, event.y)
+            if region != "cell":
+                return
+            col = self.preview_tree.identify_column(event.x)
+            if col != "#1":  # the "check" column
+                return
+            iid = self.preview_tree.identify_row(event.y)
+            if not iid:
+                return
+            # Toggle
+            checked = not self._check_states.get(iid, True)
+            self._check_states[iid] = checked
+            vals = list(self.preview_tree.item(iid, "values"))
+            vals[0] = "☑" if checked else "☐"
+            self.preview_tree.item(iid, values=vals)
+            self._update_sel_count()
+
+        def _select_all_chapters(self) -> None:
+            for iid in self.preview_tree.get_children():
+                self._check_states[iid] = True
+                vals = list(self.preview_tree.item(iid, "values"))
+                vals[0] = "☑"
+                self.preview_tree.item(iid, values=vals)
+            self._update_sel_count()
+
+        def _deselect_all_chapters(self) -> None:
+            for iid in self.preview_tree.get_children():
+                self._check_states[iid] = False
+                vals = list(self.preview_tree.item(iid, "values"))
+                vals[0] = "☐"
+                self.preview_tree.item(iid, values=vals)
+            self._update_sel_count()
+
+        def _invert_chapter_selection(self) -> None:
+            for iid in self.preview_tree.get_children():
+                checked = not self._check_states.get(iid, True)
+                self._check_states[iid] = checked
+                vals = list(self.preview_tree.item(iid, "values"))
+                vals[0] = "☑" if checked else "☐"
+                self.preview_tree.item(iid, values=vals)
+            self._update_sel_count()
+
+        def _update_sel_count(self) -> None:
+            total = len(self._check_states)
+            sel = sum(1 for v in self._check_states.values() if v)
+            self._sel_count_label.config(text=f"{sel} / {total} selected")
+
+        def _get_selected_plan_entries(self) -> list[dict]:
+            """Return the plan entries that are currently checked in the preview tree."""
+            if not self._current_plan:
+                return []
+            children = self.preview_tree.get_children()
+            selected: list[dict] = []
+            for iid, ch in zip(children, self._current_plan.chapters):
+                if self._check_states.get(iid, True):
+                    selected.append(ch)
+            return selected
 
         # ─── Extract ─────────────────────────────────────────────────
+        def _start_extraction_ui(self) -> None:
+            """Shared UI state changes when extraction begins."""
+            self._extracting = True
+            self._cancel_event.clear()
+            self.extract_btn.state(["disabled"])
+            self.extract_sel_btn.state(["disabled"])
+            self.cancel_btn.state(["!disabled"])
+            self.progress_var.set(0)
+
+        def _on_progress(self, current, total):
+            pct = (current / total) * 100 if total else 0
+            self.root.after(0, lambda: self.progress_var.set(pct))
+            self.root.after(0, lambda: self._set_status(f"Extracting… {current}/{total}"))
+
         def _extract(self) -> None:
+            """Extract ALL chapters (ignores checkbox selection)."""
             if self._extracting:
                 return
             path = self._validate_pdf()
@@ -864,27 +1019,60 @@ def run_gui() -> None:
             output_dir = self.output_dir_var.get().strip() or "chapters_output"
             chapter_level = int(self.level_var.get())
 
-            self._extracting = True
-            self._cancel_event.clear()
-            self.extract_btn.state(["disabled"])
-            self.cancel_btn.state(["!disabled"])
-            self.progress_var.set(0)
-            self._set_status("Extracting chapters…")
-
-            def on_progress(current, total):
-                pct = (current / total) * 100 if total else 0
-                self.root.after(0, lambda: self.progress_var.set(pct))
-                self.root.after(0, lambda: self._set_status(f"Extracting… {current}/{total}"))
+            self._start_extraction_ui()
+            self._set_status("Extracting all chapters…")
 
             def worker():
-                self.log_queue.put("Starting extraction…")
+                self.log_queue.put("Starting full extraction…")
                 try:
                     result = extract_chapters_from_pdf(
                         path,
                         output_dir=output_dir,
                         chapter_level=chapter_level,
                         logger=self.log_queue.put,
-                        progress_callback=on_progress,
+                        progress_callback=lambda c, t: self._on_progress(c, t),
+                        cancel_event=self._cancel_event,
+                    )
+                    n = len(result["files_written"])
+                    self.log_queue.put(f"Done. Wrote {n} files to {result['output_dir']}")
+                    self.root.after(0, lambda: self._set_status(f"Done — {n} files written"))
+                    self.root.after(0, lambda: self.progress_var.set(100))
+                except Exception as exc:
+                    self.log_queue.put(f"Error: {exc}")
+                    self.root.after(0, lambda: self._set_status("Extraction failed"))
+                finally:
+                    self.root.after(0, self._extraction_finished)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _extract_selected(self) -> None:
+            """Extract only the chapters checked in the preview tree."""
+            if self._extracting:
+                return
+            path = self._validate_pdf()
+            if not path:
+                return
+
+            entries = self._get_selected_plan_entries()
+            if not entries:
+                messagebox.showinfo("Nothing selected",
+                                    "No chapters are selected.\n\nClick Preview first, then check the chapters you want.")
+                return
+
+            output_dir = self.output_dir_var.get().strip() or "chapters_output"
+
+            self._start_extraction_ui()
+            self._set_status(f"Extracting {len(entries)} selected chapter(s)…")
+
+            def worker():
+                self.log_queue.put(f"Starting extraction of {len(entries)} selected chapter(s)…")
+                try:
+                    result = extract_selected_chapters(
+                        path,
+                        plan_entries=entries,
+                        output_dir=output_dir,
+                        logger=self.log_queue.put,
+                        progress_callback=lambda c, t: self._on_progress(c, t),
                         cancel_event=self._cancel_event,
                     )
                     n = len(result["files_written"])
@@ -902,6 +1090,7 @@ def run_gui() -> None:
         def _extraction_finished(self) -> None:
             self._extracting = False
             self.extract_btn.state(["!disabled"])
+            self.extract_sel_btn.state(["!disabled"])
             self.cancel_btn.state(["disabled"])
 
         def _cancel_extraction(self) -> None:

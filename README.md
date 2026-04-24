@@ -5,9 +5,11 @@ Extract chapter PDFs from a bookmarked source PDF, extract specific page ranges,
 ## Features
 
 - **Chapter Extraction** – split a bookmarked PDF by outline level (`0`, `1`, `2`, …).
-- **Extraction Preview** – see exactly what will be extracted *before* writing files.
+- **Selective Extraction** – preview chapters, then check/uncheck individual ones to extract only what you need.
+- **Extraction Preview** – see exactly what will be extracted *before* writing files, with Select All / Deselect All / Invert controls.
 - **Page Range Extraction** – pull out arbitrary page ranges without needing bookmarks.
-- **PDF Merging** – combine multiple PDFs into one, with drag-to-reorder support.
+- **PDF Merging** – combine multiple PDFs into one, with reorder support.
+- **Fast Performance** – uses pypdf's batch `append()` API instead of per-page cloning for dramatically faster extraction.
 - **Progress & Cancellation** – real-time progress bar with the ability to cancel mid-extraction.
 - **Inspect mode** – view available bookmark levels and a bookmark tree.
 - **Open Output Folder** – one-click to open the output directory in your file manager.
@@ -60,8 +62,10 @@ The GUI has three tabs:
 2. Choose an output folder.
 3. Click **Inspect** to see available bookmark levels.
 4. Set the chapter level and click **Preview** to review what will be extracted.
-5. Click **Extract** to start. A progress bar shows real-time status.
-6. Click **Open Output Folder** to view the results.
+5. Use the **☑/☐ checkboxes** in the preview table to include or exclude specific chapters. Use **Select All**, **Deselect All**, or **Invert** for bulk changes.
+6. Click **Extract All** to extract every chapter, or **Extract Selected** to extract only the checked ones.
+7. A progress bar shows real-time status; click **Cancel** to abort.
+8. Click **Open Output Folder** to view the results.
 
 ### 📄 Page Range
 1. Set the start and end page numbers.
